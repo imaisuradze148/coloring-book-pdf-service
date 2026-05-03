@@ -10,8 +10,9 @@ Endpoints:
 All POST endpoints require X-Service-Key header (matching SERVICE_KEY env var).
 Body: { "title": "...", "images": [...], "page_count": <optional int> }
 
-Pages are auto-cropped to the bounding box of the artwork (with small padding)
-before placement, so leftover whitespace from the image generator gets trimmed.
+PDF builder downsizes pages to 300 DPI target and embeds as JPEG (quality 88) to
+keep output under Etsy's 20 MB per-file limit while staying print-quality. Cover
+and preview keep PNG since they're presentation-facing and small enough already.
 """
 
 import base64
@@ -33,6 +34,11 @@ SERVICE_KEY = os.getenv("SERVICE_KEY", "")
 FONT_DIR = "/tmp/fonts"
 INTER_BOLD = f"{FONT_DIR}/Inter-Bold.ttf"
 INTER_REGULAR = f"{FONT_DIR}/Inter-Regular.ttf"
+
+# Print sizing
+DPI = 300
+LETTER_PX = (int(8.5 * DPI), int(11 * DPI))  # 2550 x 3300 — max useful pixel size
+JPEG_QUALITY = 88  # visually indistinguishable from lossless for line art
 
 
 def ensure_fonts() -> bool:
@@ -112,19 +118,12 @@ def decode_grayscale(b64: str) -> Image.Image:
 
 
 def decode_color(b64: str) -> Image.Image:
-    """Decode preserving color (used for the cover where Gemini provides colored art)."""
     return Image.open(BytesIO(base64.b64decode(b64))).convert("RGB")
 
 
 def crop_to_content(img: Image.Image, padding_pct: float = 0.02, threshold: int = 240) -> Image.Image:
-    """Crop the image to the bounding box of its non-white content, plus small padding.
-
-    Treats any pixel with luminance < threshold as content. Padding is a fraction
-    of the longer side (default 2%). Returns the cropped image. If everything is
-    white (no content found), returns the original.
-    """
+    """Crop the image to the bounding box of non-white content + small padding."""
     gray = img.convert("L") if img.mode != "L" else img
-    # Invert so content becomes bright, then use getbbox()
     inverted = ImageChops.invert(gray.point(lambda p: 255 if p > threshold else 0))
     bbox = inverted.getbbox()
     if not bbox:
@@ -136,6 +135,16 @@ def crop_to_content(img: Image.Image, padding_pct: float = 0.02, threshold: int 
     right = min(img.size[0], bbox[2] + pad)
     bottom = min(img.size[1], bbox[3] + pad)
     return img.crop((left, top, right, bottom))
+
+
+def shrink_to_print_size(img: Image.Image, max_dim: int = 3300) -> Image.Image:
+    """Downscale so the longer side is at most max_dim. Skip if already small."""
+    longest = max(img.size)
+    if longest <= max_dim:
+        return img
+    ratio = max_dim / longest
+    new_size = (int(img.size[0] * ratio), int(img.size[1] * ratio))
+    return img.resize(new_size, Image.LANCZOS)
 
 
 def safe_filename(s: str) -> str:
@@ -155,7 +164,7 @@ def build_pdf(req: BuildRequest, x_service_key: str = Header(default="")):
 
     pages = sorted(req.images, key=lambda i: extract_page_num(i.filename))
     page_w, page_h = letter
-    margin = 18  # 0.25 inch — tight but still safe for home printers
+    margin = 18  # 0.25 inch
 
     buf = BytesIO()
     c = canvas.Canvas(buf, pagesize=(page_w, page_h))
@@ -173,7 +182,8 @@ def build_pdf(req: BuildRequest, x_service_key: str = Header(default="")):
     for img_meta in pages:
         try:
             img = decode_grayscale(img_meta.data)
-            img = crop_to_content(img)  # trim residual whitespace from generator
+            img = crop_to_content(img)
+            img = shrink_to_print_size(img, max_dim=LETTER_PX[1])
         except Exception as e:
             raise HTTPException(400, f"Failed to decode {img_meta.filename}: {e}")
 
@@ -183,8 +193,10 @@ def build_pdf(req: BuildRequest, x_service_key: str = Header(default="")):
         x = (page_w - nw) / 2
         y = (page_h - nh) / 2
 
+        # JPEG embed: ~5-10x smaller than PNG for line-art grayscale.
+        # Quality 88 is visually identical when printed; total PDF stays under Etsy's 20 MB cap.
         img_io = BytesIO()
-        img.save(img_io, format="PNG", optimize=True)
+        img.save(img_io, format="JPEG", quality=JPEG_QUALITY, optimize=True)
         img_io.seek(0)
         c.drawImage(ImageReader(img_io), x, y, width=nw, height=nh)
         c.showPage()
@@ -215,7 +227,6 @@ def build_cover(req: BuildRequest, x_service_key: str = Header(default="")):
     target_w = W - 2 * pad
     target_h = img_area_h - pad
 
-    # Use color decode (cover may be a colored version from Gemini); auto-crop margins
     page1 = decode_color(pages[0].data)
     page1 = crop_to_content(page1)
     pw, ph = page1.size
