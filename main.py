@@ -9,6 +9,9 @@ Endpoints:
 
 All POST endpoints require X-Service-Key header (matching SERVICE_KEY env var).
 Body: { "title": "...", "images": [...], "page_count": <optional int> }
+
+Pages are auto-cropped to the bounding box of the artwork (with small padding)
+before placement, so leftover whitespace from the image generator gets trimmed.
 """
 
 import base64
@@ -20,7 +23,7 @@ from urllib.request import urlopen
 
 from fastapi import FastAPI, Header, HTTPException
 from fastapi.responses import Response
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageChops, ImageDraw, ImageFont
 from pydantic import BaseModel
 from reportlab.lib.pagesizes import letter
 from reportlab.lib.utils import ImageReader
@@ -91,7 +94,7 @@ class PageImage(BaseModel):
 class BuildRequest(BaseModel):
     images: list[PageImage] = []
     title: str = ""
-    page_count: int | None = None  # optional override; readme uses it when no images
+    page_count: int | None = None
 
 
 def auth_check(key: str) -> None:
@@ -106,6 +109,33 @@ def extract_page_num(filename: str) -> int:
 
 def decode_grayscale(b64: str) -> Image.Image:
     return Image.open(BytesIO(base64.b64decode(b64))).convert("L")
+
+
+def decode_color(b64: str) -> Image.Image:
+    """Decode preserving color (used for the cover where Gemini provides colored art)."""
+    return Image.open(BytesIO(base64.b64decode(b64))).convert("RGB")
+
+
+def crop_to_content(img: Image.Image, padding_pct: float = 0.02, threshold: int = 240) -> Image.Image:
+    """Crop the image to the bounding box of its non-white content, plus small padding.
+
+    Treats any pixel with luminance < threshold as content. Padding is a fraction
+    of the longer side (default 2%). Returns the cropped image. If everything is
+    white (no content found), returns the original.
+    """
+    gray = img.convert("L") if img.mode != "L" else img
+    # Invert so content becomes bright, then use getbbox()
+    inverted = ImageChops.invert(gray.point(lambda p: 255 if p > threshold else 0))
+    bbox = inverted.getbbox()
+    if not bbox:
+        return img
+
+    pad = int(max(img.size) * padding_pct)
+    left = max(0, bbox[0] - pad)
+    top = max(0, bbox[1] - pad)
+    right = min(img.size[0], bbox[2] + pad)
+    bottom = min(img.size[1], bbox[3] + pad)
+    return img.crop((left, top, right, bottom))
 
 
 def safe_filename(s: str) -> str:
@@ -125,7 +155,7 @@ def build_pdf(req: BuildRequest, x_service_key: str = Header(default="")):
 
     pages = sorted(req.images, key=lambda i: extract_page_num(i.filename))
     page_w, page_h = letter
-    margin = 36
+    margin = 18  # 0.25 inch — tight but still safe for home printers
 
     buf = BytesIO()
     c = canvas.Canvas(buf, pagesize=(page_w, page_h))
@@ -143,6 +173,7 @@ def build_pdf(req: BuildRequest, x_service_key: str = Header(default="")):
     for img_meta in pages:
         try:
             img = decode_grayscale(img_meta.data)
+            img = crop_to_content(img)  # trim residual whitespace from generator
         except Exception as e:
             raise HTTPException(400, f"Failed to decode {img_meta.filename}: {e}")
 
@@ -184,11 +215,13 @@ def build_cover(req: BuildRequest, x_service_key: str = Header(default="")):
     target_w = W - 2 * pad
     target_h = img_area_h - pad
 
-    page1 = decode_grayscale(pages[0].data)
+    # Use color decode (cover may be a colored version from Gemini); auto-crop margins
+    page1 = decode_color(pages[0].data)
+    page1 = crop_to_content(page1)
     pw, ph = page1.size
     ratio = min(target_w / pw, target_h / ph)
     nw, nh = int(pw * ratio), int(ph * ratio)
-    page1 = page1.resize((nw, nh), Image.LANCZOS).convert("RGB")
+    page1 = page1.resize((nw, nh), Image.LANCZOS)
     canvas_img.paste(page1, ((W - nw) // 2, pad))
 
     line_y = img_area_h + 40
@@ -239,14 +272,13 @@ def build_preview(req: BuildRequest, x_service_key: str = Header(default="")):
     n = len(pages)
     total_pages = req.page_count if req.page_count is not None else n
 
-    # Pick up to 4 evenly-spaced pages from whatever was provided
     if n >= 4:
         indices = [int(i * (n - 1) / 3) for i in range(4)]
         selected = [pages[i] for i in indices]
     else:
         selected = pages[:]
         while len(selected) < 4:
-            selected.append(pages[-1])  # pad to 4 with last page
+            selected.append(pages[-1])
 
     W = H = 2000
     canvas_img = Image.new("RGB", (W, H), "white")
@@ -269,8 +301,9 @@ def build_preview(req: BuildRequest, x_service_key: str = Header(default="")):
         cell_y = grid_top + row * (cell + gap)
 
         page_img = decode_grayscale(page.data)
+        page_img = crop_to_content(page_img)
         pw, ph = page_img.size
-        ratio = min(cell / pw, cell / ph) * 0.92
+        ratio = min(cell / pw, cell / ph) * 0.96
         nw, nh = int(pw * ratio), int(ph * ratio)
         page_img = page_img.resize((nw, nh), Image.LANCZOS).convert("RGB")
 
