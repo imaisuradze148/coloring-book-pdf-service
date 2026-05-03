@@ -3,16 +3,20 @@ Coloring Book PDF Service
 Endpoints:
   GET  /                — health check
   POST /build-pdf       — full coloring book interior PDF
-  POST /build-cover     — 2000x2000 PNG Etsy listing thumbnail (uses page 1 only)
+  POST /build-cover     — 2000x2000 PNG Etsy listing thumbnail
   POST /build-preview   — 2000x2000 PNG showing 4 sample pages
-  POST /build-readme    — customer-facing thank you + terms PDF (uses title + page_count)
+  POST /build-readme    — customer-facing thank you + terms PDF
 
-All POST endpoints require X-Service-Key header (matching SERVICE_KEY env var).
+All POST endpoints require X-Service-Key header.
 Body: { "title": "...", "images": [...], "page_count": <optional int> }
 
-PDF builder downsizes pages to 300 DPI target and embeds as JPEG (quality 88) to
-keep output under Etsy's 20 MB per-file limit while staying print-quality. Cover
-and preview keep PNG since they're presentation-facing and small enough already.
+PDF interior pages are binarized to pure black/white at 300 DPI and embedded as
+1-bit PNG. This produces tiny PDFs (~3-5 MB for 20 pages) with crisper print
+quality than JPEG/grayscale, since printers binarize line art anyway.
+
+Tunable via env vars:
+  BINARIZE_THRESHOLD   default 200; pixels darker than this become black
+  PRINT_DPI            default 300; max longest-side in pixels = 11 * DPI
 """
 
 import base64
@@ -35,10 +39,10 @@ FONT_DIR = "/tmp/fonts"
 INTER_BOLD = f"{FONT_DIR}/Inter-Bold.ttf"
 INTER_REGULAR = f"{FONT_DIR}/Inter-Regular.ttf"
 
-# Print sizing
-DPI = 300
-LETTER_PX = (int(8.5 * DPI), int(11 * DPI))  # 2550 x 3300 — max useful pixel size
-JPEG_QUALITY = 88  # visually indistinguishable from lossless for line art
+# Print/binarization config
+PRINT_DPI = int(os.getenv("PRINT_DPI", "300"))
+LETTER_MAX_PX = int(11 * PRINT_DPI)  # 3300 at 300 DPI
+BINARIZE_THRESHOLD = int(os.getenv("BINARIZE_THRESHOLD", "200"))
 
 
 def ensure_fonts() -> bool:
@@ -122,13 +126,11 @@ def decode_color(b64: str) -> Image.Image:
 
 
 def crop_to_content(img: Image.Image, padding_pct: float = 0.02, threshold: int = 240) -> Image.Image:
-    """Crop the image to the bounding box of non-white content + small padding."""
     gray = img.convert("L") if img.mode != "L" else img
     inverted = ImageChops.invert(gray.point(lambda p: 255 if p > threshold else 0))
     bbox = inverted.getbbox()
     if not bbox:
         return img
-
     pad = int(max(img.size) * padding_pct)
     left = max(0, bbox[0] - pad)
     top = max(0, bbox[1] - pad)
@@ -137,14 +139,25 @@ def crop_to_content(img: Image.Image, padding_pct: float = 0.02, threshold: int 
     return img.crop((left, top, right, bottom))
 
 
-def shrink_to_print_size(img: Image.Image, max_dim: int = 3300) -> Image.Image:
-    """Downscale so the longer side is at most max_dim. Skip if already small."""
+def shrink_to_print_size(img: Image.Image, max_dim: int = LETTER_MAX_PX) -> Image.Image:
     longest = max(img.size)
     if longest <= max_dim:
         return img
     ratio = max_dim / longest
     new_size = (int(img.size[0] * ratio), int(img.size[1] * ratio))
     return img.resize(new_size, Image.LANCZOS)
+
+
+def binarize(img: Image.Image, threshold: int = BINARIZE_THRESHOLD) -> Image.Image:
+    """Convert grayscale image to pure 1-bit B/W using a fixed threshold.
+
+    Pixels darker than threshold become black; lighter become white. No dithering
+    (we want crisp lines, not screentones). Output mode is '1' so PIL writes a
+    1-bit PNG, which reportlab embeds with Flate — typically 100-300 KB per page
+    for line art at 300 DPI.
+    """
+    gray = img.convert("L") if img.mode != "L" else img
+    return gray.point(lambda p: 255 if p > threshold else 0).convert("1")
 
 
 def safe_filename(s: str) -> str:
@@ -183,7 +196,8 @@ def build_pdf(req: BuildRequest, x_service_key: str = Header(default="")):
         try:
             img = decode_grayscale(img_meta.data)
             img = crop_to_content(img)
-            img = shrink_to_print_size(img, max_dim=LETTER_PX[1])
+            img = shrink_to_print_size(img)
+            img = binarize(img)
         except Exception as e:
             raise HTTPException(400, f"Failed to decode {img_meta.filename}: {e}")
 
@@ -193,10 +207,9 @@ def build_pdf(req: BuildRequest, x_service_key: str = Header(default="")):
         x = (page_w - nw) / 2
         y = (page_h - nh) / 2
 
-        # JPEG embed: ~5-10x smaller than PNG for line-art grayscale.
-        # Quality 88 is visually identical when printed; total PDF stays under Etsy's 20 MB cap.
+        # 1-bit PNG: deflate-compressed in the PDF, no JPEG ringing on edges.
         img_io = BytesIO()
-        img.save(img_io, format="JPEG", quality=JPEG_QUALITY, optimize=True)
+        img.save(img_io, format="PNG", optimize=True)
         img_io.seek(0)
         c.drawImage(ImageReader(img_io), x, y, width=nw, height=nh)
         c.showPage()
@@ -426,4 +439,8 @@ def health():
         "status": "ok",
         "service": "coloring-book-pdf",
         "endpoints": ["/build-pdf", "/build-cover", "/build-preview", "/build-readme"],
+        "config": {
+            "print_dpi": PRINT_DPI,
+            "binarize_threshold": BINARIZE_THRESHOLD,
+        },
     }
