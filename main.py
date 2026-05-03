@@ -3,13 +3,12 @@ Coloring Book PDF Service
 Endpoints:
   GET  /                — health check
   POST /build-pdf       — full coloring book interior PDF
-  POST /build-cover     — 2000x2000 PNG Etsy listing thumbnail
+  POST /build-cover     — 2000x2000 PNG Etsy listing thumbnail (uses page 1 only)
   POST /build-preview   — 2000x2000 PNG showing 4 sample pages
-  POST /build-readme    — customer-facing thank you + terms PDF
+  POST /build-readme    — customer-facing thank you + terms PDF (uses title + page_count)
 
 All POST endpoints require X-Service-Key header (matching SERVICE_KEY env var).
-All POST endpoints accept the same JSON body:
-  { "title": "Medieval Snails", "images": [{"filename": "page-1.png", "data": "<b64>"}, ...] }
+Body: { "title": "...", "images": [...], "page_count": <optional int> }
 """
 
 import base64
@@ -32,12 +31,8 @@ FONT_DIR = "/tmp/fonts"
 INTER_BOLD = f"{FONT_DIR}/Inter-Bold.ttf"
 INTER_REGULAR = f"{FONT_DIR}/Inter-Regular.ttf"
 
-# ---------------------------------------------------------------------------
-# Font setup
-# ---------------------------------------------------------------------------
 
 def ensure_fonts() -> bool:
-    """Download Inter on first call; cache in /tmp. Returns False on failure."""
     if os.path.exists(INTER_BOLD) and os.path.exists(INTER_REGULAR):
         return True
     try:
@@ -57,7 +52,6 @@ def ensure_fonts() -> bool:
 
 
 def get_font(size: int, bold: bool = True) -> ImageFont.ImageFont:
-    """Return Inter at the requested size, falling back to system fonts then default."""
     primary = INTER_BOLD if bold else INTER_REGULAR
     if os.path.exists(primary):
         try:
@@ -82,24 +76,22 @@ def get_font(size: int, bold: bool = True) -> ImageFont.ImageFont:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    ensure_fonts()  # pre-warm fonts on startup
+    ensure_fonts()
     yield
 
 
 app = FastAPI(title="Coloring Book PDF Service", lifespan=lifespan)
 
-# ---------------------------------------------------------------------------
-# Models & helpers
-# ---------------------------------------------------------------------------
 
 class PageImage(BaseModel):
     filename: str
-    data: str  # base64-encoded image bytes
+    data: str
 
 
 class BuildRequest(BaseModel):
-    images: list[PageImage]
+    images: list[PageImage] = []
     title: str = ""
+    page_count: int | None = None  # optional override; readme uses it when no images
 
 
 def auth_check(key: str) -> None:
@@ -124,10 +116,6 @@ def measure_text(draw: ImageDraw.ImageDraw, text: str, font: ImageFont.ImageFont
     bbox = draw.textbbox((0, 0), text, font=font)
     return bbox[2] - bbox[0], bbox[3] - bbox[1]
 
-
-# ---------------------------------------------------------------------------
-# /build-pdf — full coloring book interior
-# ---------------------------------------------------------------------------
 
 @app.post("/build-pdf")
 def build_pdf(req: BuildRequest, x_service_key: str = Header(default="")):
@@ -179,10 +167,6 @@ def build_pdf(req: BuildRequest, x_service_key: str = Header(default="")):
     )
 
 
-# ---------------------------------------------------------------------------
-# /build-cover — 2000x2000 PNG Etsy listing thumbnail
-# ---------------------------------------------------------------------------
-
 @app.post("/build-cover")
 def build_cover(req: BuildRequest, x_service_key: str = Header(default="")):
     auth_check(x_service_key)
@@ -190,6 +174,7 @@ def build_cover(req: BuildRequest, x_service_key: str = Header(default="")):
         raise HTTPException(400, "No images provided")
 
     pages = sorted(req.images, key=lambda i: extract_page_num(i.filename))
+    total_pages = req.page_count if req.page_count is not None else len(pages)
     W = H = 2000
     canvas_img = Image.new("RGB", (W, H), "white")
     draw = ImageDraw.Draw(canvas_img)
@@ -229,7 +214,7 @@ def build_cover(req: BuildRequest, x_service_key: str = Header(default="")):
     sub_y = text_y + th + 60
     draw.text(((W - sw) // 2, sub_y), subtitle, font=sub_font, fill="#666666")
 
-    pc_text = f"{len(req.images)} UNIQUE PAGES"
+    pc_text = f"{total_pages} UNIQUE PAGES"
     pc_font = get_font(36, bold=True)
     pcw, _ = measure_text(draw, pc_text, pc_font)
     draw.text(((W - pcw) // 2, sub_y + 90), pc_text, font=pc_font, fill="#999999")
@@ -244,26 +229,30 @@ def build_cover(req: BuildRequest, x_service_key: str = Header(default="")):
     )
 
 
-# ---------------------------------------------------------------------------
-# /build-preview — 2000x2000 PNG showing 4 sample pages
-# ---------------------------------------------------------------------------
-
 @app.post("/build-preview")
 def build_preview(req: BuildRequest, x_service_key: str = Header(default="")):
     auth_check(x_service_key)
-    if len(req.images) < 4:
-        raise HTTPException(400, "Need at least 4 images to build a preview")
+    if len(req.images) < 1:
+        raise HTTPException(400, "Need at least 1 image to build a preview")
 
     pages = sorted(req.images, key=lambda i: extract_page_num(i.filename))
     n = len(pages)
-    indices = [int(i * (n - 1) / 3) for i in range(4)]
-    selected = [pages[i] for i in indices]
+    total_pages = req.page_count if req.page_count is not None else n
+
+    # Pick up to 4 evenly-spaced pages from whatever was provided
+    if n >= 4:
+        indices = [int(i * (n - 1) / 3) for i in range(4)]
+        selected = [pages[i] for i in indices]
+    else:
+        selected = pages[:]
+        while len(selected) < 4:
+            selected.append(pages[-1])  # pad to 4 with last page
 
     W = H = 2000
     canvas_img = Image.new("RGB", (W, H), "white")
     draw = ImageDraw.Draw(canvas_img)
 
-    top_text = f"{n} UNIQUE PAGES INSIDE"
+    top_text = f"{total_pages} UNIQUE PAGES INSIDE"
     top_font = get_font(56, bold=True)
     tw, _ = measure_text(draw, top_text, top_font)
     draw.text(((W - tw) // 2, 80), top_text, font=top_font, fill="black")
@@ -307,16 +296,12 @@ def build_preview(req: BuildRequest, x_service_key: str = Header(default="")):
     )
 
 
-# ---------------------------------------------------------------------------
-# /build-readme — customer-facing thank you + terms PDF
-# ---------------------------------------------------------------------------
-
 @app.post("/build-readme")
 def build_readme(req: BuildRequest, x_service_key: str = Header(default="")):
     auth_check(x_service_key)
 
     title = req.title or "Coloring Book"
-    page_count = len(req.images)
+    page_count = req.page_count if req.page_count is not None else len(req.images)
 
     page_w, page_h = letter
     buf = BytesIO()
@@ -390,10 +375,6 @@ def build_readme(req: BuildRequest, x_service_key: str = Header(default="")):
         headers={"Content-Disposition": f'attachment; filename="{name}-readme.pdf"'},
     )
 
-
-# ---------------------------------------------------------------------------
-# Health
-# ---------------------------------------------------------------------------
 
 @app.get("/")
 def health():
