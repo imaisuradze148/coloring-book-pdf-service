@@ -3,20 +3,12 @@ Coloring Book PDF Service
 Endpoints:
   GET  /                — health check
   POST /build-pdf       — full coloring book interior PDF
-  POST /build-cover     — 2000x2000 PNG Etsy listing thumbnail
+  POST /build-cover     — 2000x2000 PNG Etsy listing thumbnail (uses page 1 only)
   POST /build-preview   — 2000x2000 PNG showing 4 sample pages
-  POST /build-readme    — customer-facing thank you + terms PDF
+  POST /build-readme    — customer-facing thank you + terms PDF (uses title + page_count)
 
-All POST endpoints require X-Service-Key header.
-Body: { "title": "...", "images": [...], "page_count": <optional int> }
-
-PDF interior pages are binarized to pure black/white at 300 DPI and embedded as
-1-bit PNG. This produces tiny PDFs (~3-5 MB for 20 pages) with crisper print
-quality than JPEG/grayscale, since printers binarize line art anyway.
-
-Tunable via env vars:
-  BINARIZE_THRESHOLD   default 200; pixels darker than this become black
-  PRINT_DPI            default 300; max longest-side in pixels = 11 * DPI
+Cover layout: title at top in narrow band, cover art fills the rest of the canvas,
+cream background to blend with Gemini-generated cover art (matches Etsy reference style).
 """
 
 import base64
@@ -39,10 +31,15 @@ FONT_DIR = "/tmp/fonts"
 INTER_BOLD = f"{FONT_DIR}/Inter-Bold.ttf"
 INTER_REGULAR = f"{FONT_DIR}/Inter-Regular.ttf"
 
-# Print/binarization config
+# Print sizing
 PRINT_DPI = int(os.getenv("PRINT_DPI", "300"))
-LETTER_MAX_PX = int(11 * PRINT_DPI)  # 3300 at 300 DPI
+LETTER_MAX_PX = int(11 * PRINT_DPI)
 BINARIZE_THRESHOLD = int(os.getenv("BINARIZE_THRESHOLD", "200"))
+
+# Cover canvas color — matches the cream backgrounds Gemini produces for cover art.
+# If you want pure white, change to "white". If you want a different cream, e.g.,
+# warmer or cooler, swap the hex.
+COVER_BG = os.getenv("COVER_BG", "#FFF6E8")
 
 
 def ensure_fonts() -> bool:
@@ -149,13 +146,6 @@ def shrink_to_print_size(img: Image.Image, max_dim: int = LETTER_MAX_PX) -> Imag
 
 
 def binarize(img: Image.Image, threshold: int = BINARIZE_THRESHOLD) -> Image.Image:
-    """Convert grayscale image to pure 1-bit B/W using a fixed threshold.
-
-    Pixels darker than threshold become black; lighter become white. No dithering
-    (we want crisp lines, not screentones). Output mode is '1' so PIL writes a
-    1-bit PNG, which reportlab embeds with Flate — typically 100-300 KB per page
-    for line art at 300 DPI.
-    """
     gray = img.convert("L") if img.mode != "L" else img
     return gray.point(lambda p: 255 if p > threshold else 0).convert("1")
 
@@ -177,7 +167,7 @@ def build_pdf(req: BuildRequest, x_service_key: str = Header(default="")):
 
     pages = sorted(req.images, key=lambda i: extract_page_num(i.filename))
     page_w, page_h = letter
-    margin = 18  # 0.25 inch
+    margin = 18
 
     buf = BytesIO()
     c = canvas.Canvas(buf, pagesize=(page_w, page_h))
@@ -207,7 +197,6 @@ def build_pdf(req: BuildRequest, x_service_key: str = Header(default="")):
         x = (page_w - nw) / 2
         y = (page_h - nh) / 2
 
-        # 1-bit PNG: deflate-compressed in the PDF, no JPEG ringing on edges.
         img_io = BytesIO()
         img.save(img_io, format="PNG", optimize=True)
         img_io.seek(0)
@@ -225,34 +214,27 @@ def build_pdf(req: BuildRequest, x_service_key: str = Header(default="")):
 
 @app.post("/build-cover")
 def build_cover(req: BuildRequest, x_service_key: str = Header(default="")):
+    """Layout (matches Etsy reference style):
+        - Cream background spans the entire canvas (blends with Gemini cover art)
+        - Title at top in a 25% band
+        - Cover art fills the remaining ~70% with thin padding on the sides
+        - Page count subtly anchored at the bottom
+    No big white empty area below the artwork.
+    """
     auth_check(x_service_key)
     if not req.images:
         raise HTTPException(400, "No images provided")
 
     pages = sorted(req.images, key=lambda i: extract_page_num(i.filename))
     total_pages = req.page_count if req.page_count is not None else len(pages)
+
     W = H = 2000
-    canvas_img = Image.new("RGB", (W, H), "white")
+    canvas_img = Image.new("RGB", (W, H), COVER_BG)
     draw = ImageDraw.Draw(canvas_img)
 
-    pad = 80
-    img_area_h = int(H * 0.62)
-    target_w = W - 2 * pad
-    target_h = img_area_h - pad
-
-    page1 = decode_color(pages[0].data)
-    page1 = crop_to_content(page1)
-    pw, ph = page1.size
-    ratio = min(target_w / pw, target_h / ph)
-    nw, nh = int(pw * ratio), int(ph * ratio)
-    page1 = page1.resize((nw, nh), Image.LANCZOS)
-    canvas_img.paste(page1, ((W - nw) // 2, pad))
-
-    line_y = img_area_h + 40
-    draw.line([(W // 4, line_y), (W - W // 4, line_y)], fill="black", width=4)
-
+    # === Title at top ===
     title_text = (req.title or "Coloring Book").upper()
-    title_size = 130
+    title_size = 140
     while title_size > 60:
         font = get_font(title_size, bold=True)
         tw, _ = measure_text(draw, title_text, font)
@@ -262,19 +244,40 @@ def build_cover(req: BuildRequest, x_service_key: str = Header(default="")):
 
     font = get_font(title_size, bold=True)
     tw, th = measure_text(draw, title_text, font)
-    text_y = line_y + 60
-    draw.text(((W - tw) // 2, text_y), title_text, font=font, fill="black")
+    title_y = 100
+    draw.text(((W - tw) // 2, title_y), title_text, font=font, fill="black")
 
+    # === Subtitle under title ===
     subtitle = "A COLORING BOOK"
     sub_font = get_font(48, bold=False)
     sw, _ = measure_text(draw, subtitle, sub_font)
-    sub_y = text_y + th + 60
+    sub_y = title_y + th + 30
     draw.text(((W - sw) // 2, sub_y), subtitle, font=sub_font, fill="#666666")
 
+    # === Cover art fills the rest ===
+    # Reserve a slim band at bottom for the page-count tagline.
+    img_top = sub_y + 90
+    img_bottom = H - 130  # leaves room for page-count below
+    img_area_h = img_bottom - img_top
+    img_area_w = W - 80  # 40px side padding
+
+    page1 = decode_color(pages[0].data)
+    page1 = crop_to_content(page1)
+    pw, ph = page1.size
+    # Fit-within: scale so the art fills as much of the area as possible
+    # while preserving aspect ratio. Cream background hides any leftover gaps.
+    ratio = min(img_area_w / pw, img_area_h / ph)
+    nw, nh = int(pw * ratio), int(ph * ratio)
+    page1 = page1.resize((nw, nh), Image.LANCZOS)
+    img_x = (W - nw) // 2
+    img_y = img_top + (img_area_h - nh) // 2
+    canvas_img.paste(page1, (img_x, img_y))
+
+    # === Page count anchored bottom ===
     pc_text = f"{total_pages} UNIQUE PAGES"
     pc_font = get_font(36, bold=True)
     pcw, _ = measure_text(draw, pc_text, pc_font)
-    draw.text(((W - pcw) // 2, sub_y + 90), pc_text, font=pc_font, fill="#999999")
+    draw.text(((W - pcw) // 2, H - 90), pc_text, font=pc_font, fill="#999999")
 
     out = BytesIO()
     canvas_img.save(out, format="PNG", optimize=True)
@@ -442,5 +445,6 @@ def health():
         "config": {
             "print_dpi": PRINT_DPI,
             "binarize_threshold": BINARIZE_THRESHOLD,
+            "cover_bg": COVER_BG,
         },
     }
