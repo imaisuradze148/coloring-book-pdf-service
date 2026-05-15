@@ -14,9 +14,7 @@ cream background to blend with Gemini-generated cover art (matches Etsy referenc
 import base64
 import os
 import re
-from contextlib import asynccontextmanager
 from io import BytesIO
-from urllib.request import urlopen
 
 from fastapi import FastAPI, Header, HTTPException
 from fastapi.responses import Response
@@ -27,9 +25,13 @@ from reportlab.lib.utils import ImageReader
 from reportlab.pdfgen import canvas
 
 SERVICE_KEY = os.getenv("SERVICE_KEY", "")
-FONT_DIR = "/tmp/fonts"
-INTER_BOLD = f"{FONT_DIR}/Inter-Bold.ttf"
-INTER_REGULAR = f"{FONT_DIR}/Inter-Regular.ttf"
+
+# Bundled-fonts location: drop Inter-Bold.ttf and Inter-Regular.ttf into a `fonts/`
+# directory alongside main.py to use Inter typography. Optional — without these,
+# the service falls back to Pillow's built-in scalable font (DejaVu Sans family).
+FONT_DIR_REPO = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fonts")
+INTER_BOLD = os.path.join(FONT_DIR_REPO, "Inter-Bold.ttf")
+INTER_REGULAR = os.path.join(FONT_DIR_REPO, "Inter-Regular.ttf")
 
 # Print sizing
 PRINT_DPI = int(os.getenv("PRINT_DPI", "300"))
@@ -42,26 +44,22 @@ BINARIZE_THRESHOLD = int(os.getenv("BINARIZE_THRESHOLD", "200"))
 COVER_BG = os.getenv("COVER_BG", "#FFF6E8")
 
 
-def ensure_fonts() -> bool:
-    if os.path.exists(INTER_BOLD) and os.path.exists(INTER_REGULAR):
-        return True
-    try:
-        os.makedirs(FONT_DIR, exist_ok=True)
-        urls = {
-            INTER_BOLD: "https://github.com/rsms/inter/raw/master/docs/font-files/Inter-Bold.ttf",
-            INTER_REGULAR: "https://github.com/rsms/inter/raw/master/docs/font-files/Inter-Regular.ttf",
-        }
-        for path, url in urls.items():
-            if not os.path.exists(path):
-                with urlopen(url, timeout=20) as resp:
-                    with open(path, "wb") as f:
-                        f.write(resp.read())
-        return True
-    except Exception:
-        return False
-
-
 def get_font(size: int, bold: bool = True) -> ImageFont.ImageFont:
+    """Return a TrueType font that actually scales to the requested size.
+
+    Lookup order:
+      1. Bundled Inter TTF in repo (`fonts/` dir next to main.py) — preferred typography
+      2. System DejaVu/Arial paths (common on Linux distros and macOS)
+      3. Pillow's built-in scalable font via `load_default(size=size)` — guaranteed
+         to work in Pillow 10.1+ (we have 11.0). Ships with Pillow itself, no
+         network or system dependency.
+      4. Pillow's tiny bitmap default — last resort, only hit if all of the above
+         somehow fail. Text will be unreadably small at this point.
+
+    Previously this function silently fell through to (4) when the Inter download
+    from GitHub failed (the upstream URLs changed in Inter v4), which is why all
+    text on covers was being rendered tiny regardless of the requested size.
+    """
     primary = INTER_BOLD if bold else INTER_REGULAR
     if os.path.exists(primary):
         try:
@@ -81,16 +79,17 @@ def get_font(size: int, bold: bool = True) -> ImageFont.ImageFont:
                 return ImageFont.truetype(p, size)
             except Exception:
                 continue
-    return ImageFont.load_default()
+    # Pillow's built-in font WITH size — scales properly. This is the line that
+    # fixes the "tiny text" bug.
+    try:
+        return ImageFont.load_default(size=size)
+    except TypeError:
+        # Pillow < 10.1 doesn't accept size; this branch shouldn't be hit
+        # with our requirements.txt (Pillow 11.0).
+        return ImageFont.load_default()
 
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    ensure_fonts()
-    yield
-
-
-app = FastAPI(title="Coloring Book PDF Service", lifespan=lifespan)
+app = FastAPI(title="Coloring Book PDF Service")
 
 
 class PageImage(BaseModel):
