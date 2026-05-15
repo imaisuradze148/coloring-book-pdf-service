@@ -214,12 +214,13 @@ def build_pdf(req: BuildRequest, x_service_key: str = Header(default="")):
 
 @app.post("/build-cover")
 def build_cover(req: BuildRequest, x_service_key: str = Header(default="")):
-    """Layout (matches Etsy reference style):
+    """Layout (Variant A: bold spec line, no bottom text):
         - Cream background spans the entire canvas (blends with Gemini cover art)
-        - Title at top in a 25% band
-        - Cover art fills the remaining ~70% with thin padding on the sides
-        - Page count subtly anchored at the bottom
-    No big white empty area below the artwork.
+        - Title at top
+        - Bold spec line below title: "{N} UNIQUE PRINTABLE PAGES"
+        - Cover art fills the remaining ~75% down to the bottom edge
+    Two text lines total. Page count is now the prominent second line
+    (large + bold + slightly darker) so it reads at Etsy thumbnail scale.
     """
     auth_check(x_service_key)
     if not req.images:
@@ -247,17 +248,28 @@ def build_cover(req: BuildRequest, x_service_key: str = Header(default="")):
     title_y = 100
     draw.text(((W - tw) // 2, title_y), title_text, font=font, fill="black")
 
-    # === Subtitle under title ===
-    subtitle = "A COLORING BOOK"
-    sub_font = get_font(48, bold=False)
-    sw, _ = measure_text(draw, subtitle, sub_font)
-    sub_y = title_y + th + 30
-    draw.text(((W - sw) // 2, sub_y), subtitle, font=sub_font, fill="#666666")
+    # === Spec line under title (Variant A) ===
+    # Replaces the generic "A COLORING BOOK" subtitle with a concrete value
+    # statement that buyers see at thumbnail scale. Bold + larger + darker
+    # than the old subtitle so it actually carries weight on the cover.
+    spec_text = f"{total_pages} UNIQUE PRINTABLE PAGES"
+    spec_size = 72
+    while spec_size > 44:
+        spec_font = get_font(spec_size, bold=True)
+        sw, _ = measure_text(draw, spec_text, spec_font)
+        if sw <= W - 200:
+            break
+        spec_size -= 4
 
-    # === Cover art fills the rest ===
-    # Reserve a slim band at bottom for the page-count tagline.
-    img_top = sub_y + 90
-    img_bottom = H - 130  # leaves room for page-count below
+    spec_font = get_font(spec_size, bold=True)
+    sw, sh = measure_text(draw, spec_text, spec_font)
+    sub_y = title_y + th + 35
+    draw.text(((W - sw) // 2, sub_y), spec_text, font=spec_font, fill="#3A3A3A")
+
+    # === Cover art fills the rest, all the way down to near the bottom ===
+    # Removed the bottom page-count line, so the image can extend further.
+    img_top = sub_y + sh + 60
+    img_bottom = H - 70  # was H - 130 when the bottom text occupied space
     img_area_h = img_bottom - img_top
     img_area_w = W - 80  # 40px side padding
 
@@ -273,11 +285,7 @@ def build_cover(req: BuildRequest, x_service_key: str = Header(default="")):
     img_y = img_top + (img_area_h - nh) // 2
     canvas_img.paste(page1, (img_x, img_y))
 
-    # === Page count anchored bottom ===
-    pc_text = f"{total_pages} UNIQUE PAGES"
-    pc_font = get_font(36, bold=True)
-    pcw, _ = measure_text(draw, pc_text, pc_font)
-    draw.text(((W - pcw) // 2, H - 90), pc_text, font=pc_font, fill="#999999")
+    # (Variant A: no bottom page-count text; spec line above carries that info.)
 
     out = BytesIO()
     canvas_img.save(out, format="PNG", optimize=True)
