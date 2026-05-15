@@ -154,6 +154,117 @@ def safe_filename(s: str) -> str:
     return re.sub(r"[^a-z0-9-]+", "-", s.lower()).strip("-") or "coloring-book"
 
 
+def shorten_title_for_cover(title: str) -> str:
+    """Strip common Etsy SEO phrases that clutter the cover but aren't needed visually.
+
+    Your Etsy listing title is optimized for search (long, keyword-stuffed).
+    The cover image needs a short, punchy display title that reads at thumbnail scale.
+    This function extracts the core niche from a typical SEO title pattern.
+
+    Examples:
+        'Gothic Coloring Book for Adults, Dark Engraving Art' -> 'GOTHIC'
+        'Teen Girls Positive Affirmations Coloring Book' -> 'TEEN GIRLS POSITIVE AFFIRMATIONS'
+        'Dragon Coloring Book for Kids Ages 4-7' -> 'DRAGON'
+        'Animal Detectives Coloring Book' -> 'ANIMAL DETECTIVES'
+        'Gothic Architecture Coloring Book for Adults' -> 'GOTHIC ARCHITECTURE'
+    """
+    if not title:
+        return "COLORING BOOK"
+
+    s = title.upper().strip()
+
+    # Sort by length descending so longer patterns are stripped before shorter
+    # overlapping ones (e.g., "COLORING BOOK FOR ADULTS" before "COLORING BOOK").
+    strips = sorted(
+        [
+            " COLORING BOOK FOR TEEN GIRLS",
+            " COLORING BOOK FOR ADULTS",
+            " COLORING BOOK FOR TEENS",
+            " COLORING BOOK FOR KIDS",
+            " COLORING BOOK",
+            " FOR TEEN GIRLS",
+            " FOR ADULTS",
+            " FOR TEENS",
+            " FOR KIDS",
+            " AGES 4-7",
+            " AGES 8-12",
+            ", PRINTABLE PDF",
+            ", INSTANT DOWNLOAD",
+            ", SELF-CARE GIFT",
+            ", DIGITAL DOWNLOAD",
+            ", PRINTABLE",
+        ],
+        key=len,
+        reverse=True,
+    )
+
+    for phrase in strips:
+        s = s.replace(phrase, "")
+
+    # If the title still has a comma, keep only the part before it — typical
+    # Etsy pattern is "[CORE NICHE] Coloring Book for X, [SECONDARY KEYWORDS]",
+    # and after stripping the middle, "[CORE NICHE], [SECONDARY]" remains.
+    if "," in s:
+        s = s.split(",")[0]
+
+    # Collapse whitespace, strip stray punctuation
+    s = " ".join(s.split()).strip(" ,.-")
+
+    return s or "COLORING BOOK"
+
+
+def fit_title(
+    draw: ImageDraw.ImageDraw,
+    text: str,
+    max_width: int,
+    max_size: int = 200,
+    min_size: int = 80,
+    max_lines: int = 2,
+):
+    """Find the largest font size where text fits, wrapping to multiple lines if needed.
+
+    Returns (lines_list, font, font_size).
+
+    Strategy:
+      1. Try single-line at decreasing font sizes (200 -> 80 in steps of 8)
+      2. If single-line at min_size still doesn't fit, try 2-line wrap.
+         Find the split point that maximizes the resulting font size.
+      3. Fallback to min_size single line (may overflow; rare case).
+    """
+    text = text.upper()
+
+    # Single-line attempt
+    for size in range(max_size, min_size - 1, -8):
+        font = get_font(size, bold=True)
+        w, _ = measure_text(draw, text, font)
+        if w <= max_width:
+            return [text], font, size
+
+    # Multi-line wrap
+    if max_lines >= 2:
+        words = text.split()
+        if len(words) >= 2:
+            best_size = 0
+            best_lines = None
+            for split_idx in range(1, len(words)):
+                line1 = " ".join(words[:split_idx])
+                line2 = " ".join(words[split_idx:])
+                for size in range(max_size, min_size - 1, -8):
+                    font_try = get_font(size, bold=True)
+                    w1, _ = measure_text(draw, line1, font_try)
+                    w2, _ = measure_text(draw, line2, font_try)
+                    if w1 <= max_width and w2 <= max_width:
+                        if size > best_size:
+                            best_size = size
+                            best_lines = [line1, line2]
+                        break
+            if best_lines:
+                return best_lines, get_font(best_size, bold=True), best_size
+
+    # Couldn't fit even with wrapping
+    return [text], get_font(min_size, bold=True), min_size
+
+
 def measure_text(draw: ImageDraw.ImageDraw, text: str, font: ImageFont.ImageFont):
     bbox = draw.textbbox((0, 0), text, font=font)
     return bbox[2] - bbox[0], bbox[3] - bbox[1]
@@ -233,20 +344,28 @@ def build_cover(req: BuildRequest, x_service_key: str = Header(default="")):
     canvas_img = Image.new("RGB", (W, H), COVER_BG)
     draw = ImageDraw.Draw(canvas_img)
 
-    # === Title at top ===
-    title_text = (req.title or "Coloring Book").upper()
-    title_size = 140
-    while title_size > 60:
-        font = get_font(title_size, bold=True)
-        tw, _ = measure_text(draw, title_text, font)
-        if tw <= W - 200:
-            break
-        title_size -= 8
+    # === Title at top (Variant A: smart-shortened, wraps to 2 lines if needed) ===
+    # We shorten the long Etsy SEO title to a punchy core phrase for the cover,
+    # then size it as large as it will go. The full SEO title still lives in
+    # the listing — this only affects the cover image.
+    cover_title = shorten_title_for_cover(req.title)
+    title_lines, title_font, title_size = fit_title(
+        draw,
+        cover_title,
+        max_width=W - 160,
+        max_size=240,
+        min_size=80,
+        max_lines=2,
+    )
 
-    font = get_font(title_size, bold=True)
-    tw, th = measure_text(draw, title_text, font)
     title_y = 100
-    draw.text(((W - tw) // 2, title_y), title_text, font=font, fill="black")
+    line_height = int(title_size * 1.10)
+    last_line_bottom_y = title_y
+    for line in title_lines:
+        tw, th = measure_text(draw, line, title_font)
+        draw.text(((W - tw) // 2, title_y), line, font=title_font, fill="black")
+        last_line_bottom_y = title_y + th
+        title_y += line_height
 
     # === Spec line under title (Variant A) ===
     # Replaces the generic "A COLORING BOOK" subtitle with a concrete value
@@ -263,7 +382,7 @@ def build_cover(req: BuildRequest, x_service_key: str = Header(default="")):
 
     spec_font = get_font(spec_size, bold=True)
     sw, sh = measure_text(draw, spec_text, spec_font)
-    sub_y = title_y + th + 35
+    sub_y = last_line_bottom_y + 35
     draw.text(((W - sw) // 2, sub_y), spec_text, font=spec_font, fill="#3A3A3A")
 
     # === Cover art fills the rest, all the way down to near the bottom ===
